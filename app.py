@@ -1,0 +1,425 @@
+import streamlit as st
+import pandas as pd
+from supabase import create_client, Client
+from datetime import datetime
+import time
+
+# --- CONFIGURATION DE LA PAGE ---
+st.set_page_config(page_title="SkillQuest - Appels", layout="wide")
+
+# --- 1. SECURITE & AUTHENTIFICATION ---
+def check_password():
+    """Retourne True si l'utilisateur est connecté, sinon affiche le formulaire."""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.title("🔒 Accès Restreint")
+        password = st.text_input("Veuillez entrer le mot de passe administrateur", type="password")
+        
+        if st.button("Se connecter"):
+            if password == st.secrets["general"]["password"]:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Mot de passe incorrect.")
+    
+    return False
+
+if not check_password():
+    st.stop()
+
+# --- CONFIGURATION SUPABASE ---
+try:
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    supabase: Client = create_client(url, key)
+except Exception as e:
+    st.error("Erreur de configuration des secrets Supabase.")
+    st.stop()
+
+st.title("🎓 SkillQuest - Gestion des Appels")
+
+# --- FONCTIONS UTILITAIRES ---
+
+def get_or_create_student(email, prenom, nom, numero=None):
+    # Vérifie si l'étudiant existe par email
+    res = supabase.table("students").select("id").eq("email", email).execute()
+    if res.data:
+        return res.data[0]['id']
+    else:
+        new_student = {
+            "email": email,
+            "first_name": prenom,
+            "last_name": nom,
+            "student_number": str(numero) if numero else None
+        }
+        res = supabase.table("students").insert(new_student).execute()
+        return res.data[0]['id']
+
+# --- INTERFACE ---
+tab1, tab2, tab3, tab4 = st.tabs(["📥 Importer Inscriptions", "✅ Faire l'Appel", "📊 Statistiques Globales", "📉 Rapports d'Absence"])
+
+# ==============================================================================
+# TAB 1 : IMPORTATION DU FICHIER MOODLE & HISTORIQUE
+# ==============================================================================
+with tab1:
+    col_import, col_hist = st.columns([2, 1])
+
+    # --- Historique ---
+    with col_hist:
+        st.subheader("📜 Historique")
+        hist_response = supabase.table("sessions").select("date, name").order("date", desc=True).execute()
+        if hist_response.data:
+            df_hist = pd.DataFrame(hist_response.data)
+            df_hist.columns = ["Date", "Nom"]
+            st.dataframe(df_hist, use_container_width=True, hide_index=True)
+        else:
+            st.info("Aucune session.")
+
+    # --- Importation ---
+    with col_import:
+        st.header("Importer une nouvelle session")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            date_session = st.date_input("Date de la session", datetime.now())
+        with c2:
+            nom_session = st.text_input("Nom", f"Session du {date_session.strftime('%d/%m')}")
+
+        # NOUVEAU : Zone de texte pour le détail
+        details_session = st.text_area(
+            "Détails de la séance (Copier/Coller la liste des activités/salles ici)",
+            height=150,
+            placeholder="Activité 01 : ... - G104\nActivité 02 : ... - G110"
+        )
+
+        uploaded_file = st.file_uploader("Fichier Excel Moodle (.xlsx)", type=["xlsx"])
+
+        if uploaded_file and st.button("Lancer l'importation", type="primary"):
+            with st.spinner("Traitement..."):
+                try:
+                    # 1. Créer Session AVEC DÉTAILS
+                    session_data = {
+                        "date": str(date_session),
+                        "name": nom_session,
+                        "details": details_session # On enregistre le texte ici
+                    }
+                    res_session = supabase.table("sessions").insert(session_data).execute()
+                    session_id = res_session.data[0]['id']
+                    
+                    # 2. Lire Excel
+                    df = pd.read_excel(uploaded_file)
+                    
+                    # 3. Créer Activités
+                    groupes_uniques = df['Groupe'].unique()
+                    activity_mapping = {} 
+                    for grp_name in groupes_uniques:
+                        if pd.isna(grp_name): continue
+                        act_data = {"session_id": session_id, "name": str(grp_name).strip(), "room": "À définir"}
+                        res_act = supabase.table("activities").insert(act_data).execute()
+                        activity_mapping[grp_name] = res_act.data[0]['id']
+                    
+                    # 4. Créer Étudiants & Inscriptions
+                    count_inscrits = 0
+                    progress_bar = st.progress(0)
+                    total_rows = len(df)
+                    
+                    for index, row in df.iterrows():
+                        if pd.isna(row['Groupe']): continue
+                        
+                        email = row.get('Adresse de courriel', '')
+                        prenom = row.get('Prénom', '')
+                        nom = row.get('Nom de famille', '')
+                        
+                        stu_id = get_or_create_student(email, prenom, nom)
+                        
+                        if row['Groupe'] in activity_mapping:
+                            act_id = activity_mapping[row['Groupe']]
+                            supabase.table("registrations").upsert(
+                                {"student_id": stu_id, "activity_id": act_id, "is_present": False},
+                                on_conflict="student_id, activity_id"
+                            ).execute()
+                            count_inscrits += 1
+                        
+                        progress_bar.progress((index + 1) / total_rows)
+                    
+                    st.success(f"✅ Import terminé ! {count_inscrits} étudiants inscrits.")
+                    time.sleep(1)
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
+
+# ==============================================================================
+# TAB 2 : FAIRE L'APPEL (AVEC AIDE-MÉMOIRE)
+# ==============================================================================
+with tab2:
+    st.header("Feuille de présence numérique")
+
+    # 1. Sélection de la Session
+    sessions_resp = supabase.table("sessions").select("*").order("date", desc=True).execute()
+    sessions = sessions_resp.data
+    
+    if not sessions:
+        st.warning("Aucune session trouvée.")
+    else:
+        session_options = {s['id']: f"{s['date']} - {s['name']}" for s in sessions}
+        selected_session_id = st.selectbox("Choisir la session", options=list(session_options.keys()), format_func=lambda x: session_options[x])
+
+        # --- NOUVEAU : AFFICHAGE DU DÉTAIL / SALLES ---
+        # On retrouve les infos de la session sélectionnée
+        current_session = next((s for s in sessions if s['id'] == selected_session_id), None)
+        
+        if current_session and current_session.get('details'):
+            with st.expander("ℹ️ Voir le détail des activités et salles (Aide-mémoire)", expanded=True):
+                st.markdown(current_session['details'].replace("\n", "  \n")) 
+                # .replace sert à forcer les sauts de ligne en Markdown
+        # ----------------------------------------------
+
+        # 2. Sélection de l'Activité
+        act_resp = supabase.table("activities").select("*").eq("session_id", selected_session_id).order("name").execute()
+        activities = act_resp.data
+        
+        if activities:
+            act_options = {a['id']: a['name'] for a in activities}
+            selected_act_id = st.selectbox("Choisir le groupe / l'activité", options=list(act_options.keys()), format_func=lambda x: act_options[x])
+            
+            # 3. Récupération Liste
+            data_resp = supabase.table("registrations")\
+                .select("id, is_present, comment, students(first_name, last_name, email)")\
+                .eq("activity_id", selected_act_id)\
+                .execute()
+            
+            regs = data_resp.data
+            
+            if regs:
+                list_for_df = []
+                for r in regs:
+                    student = r['students']
+                    list_for_df.append({
+                        "reg_id": r['id'],
+                        "Nom": student['last_name'],
+                        "Prénom": student['first_name'],
+                        "Email": student['email'],
+                        "Présent": r['is_present'],
+                        "Commentaire": r['comment'] if r['comment'] else ""
+                    })
+                
+                df_appel = pd.DataFrame(list_for_df).sort_values("Nom")
+                
+                st.info(f"Nombre d'inscrits : {len(df_appel)}")
+                
+                # --- ÉDITEUR ---
+                edited_df = st.data_editor(
+                    df_appel,
+                    column_config={
+                        "reg_id": None, 
+                        "Présent": st.column_config.CheckboxColumn("Présent ?", default=False),
+                        "Commentaire": st.column_config.TextColumn("Commentaire", width="large")
+                    },
+                    disabled=["Nom", "Prénom", "Email"],
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                if st.button("💾 Enregistrer l'appel", type="primary"):
+                    with st.spinner("Sauvegarde..."):
+                        for index, row in edited_df.iterrows():
+                            supabase.table("registrations").update({
+                                "is_present": row['Présent'],
+                                "comment": row['Commentaire'],
+                                "marked_at": datetime.now().isoformat()
+                            }).eq("id", row['reg_id']).execute()
+                        
+                    st.success("Appel enregistré !")
+            else:
+                st.info("Aucun inscrit dans ce groupe.")
+        else:
+            st.warning("Aucune activité trouvée pour cette session.")
+
+# ==============================================================================
+# TAB 3 : STATISTIQUES & ANALYSE DÉTAILLÉE (CORRIGÉ)
+# ==============================================================================
+with tab3:
+    st.header("📊 Tableau de Bord Analytique")
+    
+    # Bouton pour charger/rafraîchir les données
+    if st.button("🔄 Charger / Rafraîchir les données", key="refresh_stats"):
+        with st.spinner("Calcul des statistiques en cours..."):
+            # 1. Récupération de TOUTES les données
+            response = supabase.table("registrations").select(
+                "is_present, activities(name, sessions(date, name))"
+            ).execute()
+            
+            data = response.data
+            
+            if not data:
+                st.warning("Pas assez de données pour générer des statistiques.")
+            else:
+                # 2. Transformation en DataFrame Pandas
+                rows = []
+                for item in data:
+                    act = item['activities']
+                    sess = act['sessions']
+                    rows.append({
+                        "Date": sess['date'],
+                        "Session": sess['name'],
+                        "Activité": act['name'],
+                        "Statut": "Présent" if item['is_present'] else "Absent"
+                    })
+                
+                # STOCKAGE DANS LA SESSION (C'est ici que la magie opère)
+                st.session_state['df_stats'] = pd.DataFrame(rows)
+
+    # VÉRIFICATION : Est-ce qu'on a des données en mémoire ?
+    if 'df_stats' in st.session_state:
+        df_stats = st.session_state['df_stats']
+
+        # --- KPI GLOBAUX ---
+        total_inscrits = len(df_stats)
+        total_absents = len(df_stats[df_stats["Statut"] == "Absent"])
+        taux_absenteisme = (total_absents / total_inscrits) * 100 if total_inscrits > 0 else 0
+
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("Total Inscriptions", total_inscrits)
+        kpi2.metric("Total Absences", total_absents)
+        kpi3.metric("Taux d'absentéisme Global", f"{taux_absenteisme:.1f} %", delta_color="inverse")
+
+        st.divider()
+
+        # --- ANALYSE PAR SESSION (DATE) ---
+        st.subheader("📅 Absentéisme par Session")
+        
+        df_session = df_stats.groupby(["Date", "Session"]).agg(
+            Inscrits=('Statut', 'count'),
+            Absents=('Statut', lambda x: (x == 'Absent').sum())
+        ).reset_index()
+        
+        df_session["% Absentéisme"] = (100*df_session["Absents"] / df_session["Inscrits"])
+        
+        st.dataframe(
+            df_session.style.format({"% Absentéisme": "{:.1%}"}),
+            column_config={
+                "% Absentéisme": st.column_config.ProgressColumn(
+                    "Taux d'absence",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                ),
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.divider()
+
+        # --- ANALYSE DÉTAILLÉE PAR ACTIVITÉ ---
+        st.subheader("🏊 Détail par Activité")
+        st.caption("Filtrer pour voir les détails d'une date spécifique.")
+
+        # FILTRE INTERACTIF (Ne fait plus disparaître les données)
+        dates_dispo = sorted(df_stats["Date"].unique(), reverse=True)
+        selected_date_filter = st.selectbox("Filtrer par date", ["Toutes les dates"] + list(dates_dispo))
+
+        # Application du filtre
+        if selected_date_filter == "Toutes les dates":
+            df_filtered = df_stats
+        else:
+            df_filtered = df_stats[df_stats["Date"] == selected_date_filter]
+
+        # Groupement par Activité
+        df_activity = df_filtered.groupby(["Activité", "Session"]).agg(
+            Inscrits=('Statut', 'count'),
+            Absents=('Statut', lambda x: (x == 'Absent').sum())
+        ).reset_index()
+
+        if not df_activity.empty:
+            df_activity["% Absentéisme"] = (100*df_activity["Absents"] / df_activity["Inscrits"])
+            
+            # Tri par taux d'absentéisme décroissant
+            df_activity = df_activity.sort_values(by="% Absentéisme", ascending=False)
+
+            st.dataframe(
+                df_activity,
+                column_config={
+                    "% Absentéisme": st.column_config.ProgressColumn(
+                        "Taux d'absence",
+                        format="%.1f%%",
+                        min_value=0,
+                        max_value=100,
+                    ),
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Aucune donnée pour cette sélection.")
+    
+    else:
+        st.info("Cliquez sur le bouton ci-dessus pour charger les statistiques.")
+
+
+# ==============================================================================
+# TAB 4 : RAPPORTS D'ABSENCE (AVEC COMMENTAIRES)
+# ==============================================================================
+with tab4:
+    st.header("📉 Rapport d'Absence par Session")
+    st.caption("Liste filtrée des étudiants n'ayant pas été marqués présents.")
+
+    if not sessions:
+        st.warning("Aucune session disponible.")
+    else:
+        session_options_rpt = {s['id']: f"{s['date']} - {s['name']}" for s in sessions}
+        rpt_session_id = st.selectbox("Sélectionnez la date du rapport :", options=list(session_options_rpt.keys()), format_func=lambda x: session_options_rpt[x])
+
+        if st.button("Générer la liste des absents"):
+            with st.spinner("Récupération des données..."):
+                acts_resp = supabase.table("activities").select("id, name").eq("session_id", rpt_session_id).execute()
+                act_ids = [a['id'] for a in acts_resp.data]
+                
+                if not act_ids:
+                    st.warning("Aucune activité trouvée pour cette session.")
+                else:
+                    # Ajout de 'comment' dans la requête
+                    absents_resp = supabase.table("registrations")\
+                        .select("is_present, comment, students(first_name, last_name, email), activities(name)")\
+                        .in_("activity_id", act_ids)\
+                        .eq("is_present", False)\
+                        .execute()
+                    
+                    data_absents = absents_resp.data
+                    
+                    if data_absents:
+                        clean_list = []
+                        for item in data_absents:
+                            stu = item['students']
+                            act = item['activities']
+                            clean_list.append({
+                                "Activité": act['name'],
+                                "Nom": stu['last_name'],
+                                "Prénom": stu['first_name'],
+                                "Email": stu['email'],
+                                "Commentaire": item['comment'] if item['comment'] else "" # Afficher le motif
+                            })
+                        
+                        df_absents = pd.DataFrame(clean_list).sort_values(by=["Activité", "Nom"])
+                        
+                        st.subheader(f"Absents : {len(df_absents)} étudiants")
+                        st.dataframe(df_absents, use_container_width=True, hide_index=True)
+                        
+                        csv = df_absents.to_csv(index=False).encode('utf-8')
+                        filename = f"Absents_{session_options_rpt[rpt_session_id]}.csv"
+                        
+                        st.download_button(
+                            label="📥 Télécharger la liste (CSV)",
+                            data=csv,
+                            file_name=filename,
+                            mime='text/csv',
+                        )
+                    else:
+                        st.success("Aucun absent détecté pour cette session.")
