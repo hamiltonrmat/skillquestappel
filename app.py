@@ -72,67 +72,91 @@ def get_or_create_student(email, prenom, nom, numero=None):
 # --- INTERFACE ---
 tab1, tab2, tab3, tab4 = st.tabs(["📥 Importer Inscriptions", "✅ Faire l'Appel", "📊 Statistiques Globales", "📉 Rapports d'Absence"])
 
+
 # ==============================================================================
 # TAB 1 : IMPORTATION DU FICHIER MOODLE & HISTORIQUE
 # ==============================================================================
 with tab1:
     col_import, col_hist = st.columns([2, 1])
 
-    # --- Historique ---
+    # --- Historique (Mis à jour avec le créneau) ---
     with col_hist:
-        st.subheader("📜 Historique")
-        hist_response = supabase.table("sessions").select("date, name").order("date", desc=True).execute()
+        st.subheader("📜 Historique des imports")
+        st.caption("Trié par date et créneau")
+        # On récupère le créneau et on trie par Date décroissante puis Créneau décroissant
+        hist_response = supabase.table("sessions").select("date, time_slot, name").order("date", desc=True).order("time_slot", desc=True).execute()
         if hist_response.data:
             df_hist = pd.DataFrame(hist_response.data)
-            df_hist.columns = ["Date", "Nom"]
+            df_hist.columns = ["Date", "Créneau", "Nom"]
             st.dataframe(df_hist, use_container_width=True, hide_index=True)
         else:
-            st.info("Aucune session.")
+            st.info("Aucune session importée.")
 
-    # --- Importation ---
+    # --- Importation (Mis à jour avec la logique de mise à jour) ---
     with col_import:
-        st.header("Importer une nouvelle session")
+        st.header("Importer / Mettre à jour une session")
         
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns([1.5, 1, 2])
         with c1:
-            date_session = st.date_input("Date de la session", datetime.now())
+            date_session = st.date_input("Date de la séance", datetime.now())
         with c2:
-            nom_session = st.text_input("Nom", f"Session du {date_session.strftime('%d/%m')}")
+            # Liste des créneaux de ton école (tu peux la modifier)
+            creneaux_dispo = ["08h30", "10h15", "13h15", "15h00", "16h45", "18h30"]
+            creneau_session = st.selectbox("Créneau", creneaux_dispo)
+        with c3:
+            nom_session = st.text_input("Nom de la séance", f"Séance du {date_session.strftime('%d/%m')}")
 
-        # NOUVEAU : Zone de texte pour le détail
         details_session = st.text_area(
-            "Détails de la séance (Copier/Coller la liste des activités/salles ici)",
-            height=150,
+            "Détails de la séance (Texte d'aide pour l'appel)",
+            height=100,
             placeholder="Activité 01 : ... - G104\nActivité 02 : ... - G110"
         )
 
         uploaded_file = st.file_uploader("Fichier Excel Moodle (.xlsx)", type=["xlsx"])
 
         if uploaded_file and st.button("Lancer l'importation", type="primary"):
-            with st.spinner("Traitement..."):
+            with st.spinner("Analyse et mise à jour en cours..."):
                 try:
-                    # 1. Créer Session AVEC DÉTAILS
+                    # 1. Créer ou Mettre à jour la Session (UPSERT)
                     session_data = {
                         "date": str(date_session),
+                        "time_slot": creneau_session,
                         "name": nom_session,
-                        "details": details_session # On enregistre le texte ici
+                        "details": details_session
                     }
-                    res_session = supabase.table("sessions").insert(session_data).execute()
+                    # on_conflict indique à la base de données sur quoi se baser pour savoir si ça existe déjà
+                    res_session = supabase.table("sessions").upsert(
+                        session_data, on_conflict="date, time_slot"
+                    ).execute()
+                    
                     session_id = res_session.data[0]['id']
                     
                     # 2. Lire Excel
                     df = pd.read_excel(uploaded_file)
                     
-                    # 3. Créer Activités
+                    # 3. Gérer les Activités sans faire de doublons en cas de ré-import
                     groupes_uniques = df['Groupe'].unique()
+                    
+                    # On récupère les activités DÉJÀ existantes pour cette session
+                    existing_acts_resp = supabase.table("activities").select("id, name").eq("session_id", session_id).execute()
+                    existing_acts = {a['name']: a['id'] for a in existing_acts_resp.data}
+                    
                     activity_mapping = {} 
+                    
                     for grp_name in groupes_uniques:
                         if pd.isna(grp_name): continue
-                        act_data = {"session_id": session_id, "name": str(grp_name).strip(), "room": "À définir"}
-                        res_act = supabase.table("activities").insert(act_data).execute()
-                        activity_mapping[grp_name] = res_act.data[0]['id']
+                        grp_str = str(grp_name).strip()
+                        
+                        if grp_str in existing_acts:
+                            # L'activité existe déjà, on récupère juste son ID
+                            activity_mapping[grp_name] = existing_acts[grp_str]
+                        else:
+                            # C'est une nouvelle activité, on la crée
+                            act_data = {"session_id": session_id, "name": grp_str, "room": "À définir"}
+                            res_act = supabase.table("activities").insert(act_data).execute()
+                            activity_mapping[grp_name] = res_act.data[0]['id']
                     
-                    # 4. Créer Étudiants & Inscriptions
+                    # 4. Gérer les Étudiants & Inscriptions
                     count_inscrits = 0
                     progress_bar = st.progress(0)
                     total_rows = len(df)
@@ -148,6 +172,7 @@ with tab1:
                         
                         if row['Groupe'] in activity_mapping:
                             act_id = activity_mapping[row['Groupe']]
+                            # Upsert de l'inscription
                             supabase.table("registrations").upsert(
                                 {"student_id": stu_id, "activity_id": act_id, "is_present": False},
                                 on_conflict="student_id, activity_id"
@@ -156,48 +181,46 @@ with tab1:
                         
                         progress_bar.progress((index + 1) / total_rows)
                     
-                    st.success(f"✅ Import terminé ! {count_inscrits} étudiants inscrits.")
-                    time.sleep(1)
+                    st.success(f"✅ Terminé ! {count_inscrits} inscriptions synchronisées pour le créneau de {creneau_session}.")
+                    time.sleep(2)
                     st.rerun()
                     
                 except Exception as e:
-                    st.error(f"Erreur : {e}")
+                    st.error(f"Erreur lors de l'import : {e}")
 
 # ==============================================================================
 # TAB 2 : FAIRE L'APPEL (AVEC AIDE-MÉMOIRE)
 # ==============================================================================
+# ==============================================================================
+# TAB 2 : FAIRE L'APPEL
+# ==============================================================================
 with tab2:
     st.header("Feuille de présence numérique")
 
-    # 1. Sélection de la Session
-    sessions_resp = supabase.table("sessions").select("*").order("date", desc=True).execute()
+    # On trie par date puis par créneau
+    sessions_resp = supabase.table("sessions").select("*").order("date", desc=True).order("time_slot", desc=True).execute()
     sessions = sessions_resp.data
     
     if not sessions:
         st.warning("Aucune session trouvée.")
     else:
-        session_options = {s['id']: f"{s['date']} - {s['name']}" for s in sessions}
-        selected_session_id = st.selectbox("Choisir la session", options=list(session_options.keys()), format_func=lambda x: session_options[x])
+        # Affichage clair : Date | Créneau - Nom
+        session_options = {s['id']: f"{s['date']} | {s.get('time_slot', 'Heure N/A')} - {s['name']}" for s in sessions}
+        selected_session_id = st.selectbox("Choisir la séance", options=list(session_options.keys()), format_func=lambda x: session_options[x])
 
-        # --- NOUVEAU : AFFICHAGE DU DÉTAIL / SALLES ---
-        # On retrouve les infos de la session sélectionnée
         current_session = next((s for s in sessions if s['id'] == selected_session_id), None)
         
         if current_session and current_session.get('details'):
             with st.expander("ℹ️ Voir le détail des activités et salles (Aide-mémoire)", expanded=True):
                 st.markdown(current_session['details'].replace("\n", "  \n")) 
-                # .replace sert à forcer les sauts de ligne en Markdown
-        # ----------------------------------------------
 
-        # 2. Sélection de l'Activité
         act_resp = supabase.table("activities").select("*").eq("session_id", selected_session_id).order("name").execute()
         activities = act_resp.data
         
         if activities:
             act_options = {a['id']: a['name'] for a in activities}
-            selected_act_id = st.selectbox("Choisir le groupe / l'activité", options=list(act_options.keys()), format_func=lambda x: act_options[x])
+            selected_act_id = st.selectbox("Choisir l'activité", options=list(act_options.keys()), format_func=lambda x: act_options[x])
             
-            # 3. Récupération Liste
             data_resp = supabase.table("registrations")\
                 .select("id, is_present, comment, students(first_name, last_name, email)")\
                 .eq("activity_id", selected_act_id)\
@@ -220,9 +243,8 @@ with tab2:
                 
                 df_appel = pd.DataFrame(list_for_df).sort_values("Nom")
                 
-                st.info(f"Nombre d'inscrits : {len(df_appel)}")
+                st.info(f"Inscrits : {len(df_appel)}")
                 
-                # --- ÉDITEUR ---
                 edited_df = st.data_editor(
                     df_appel,
                     column_config={
@@ -375,15 +397,22 @@ with tab3:
 # ==============================================================================
 # TAB 4 : RAPPORTS D'ABSENCE (AVEC COMMENTAIRES)
 # ==============================================================================
+# ==============================================================================
+# TAB 4 : RAPPORTS D'ABSENCE
+# ==============================================================================
 with tab4:
-    st.header("📉 Rapport d'Absence par Session")
+    st.header("📉 Rapport d'Absence par Séance")
     st.caption("Liste filtrée des étudiants n'ayant pas été marqués présents.")
 
     if not sessions:
         st.warning("Aucune session disponible.")
     else:
-        session_options_rpt = {s['id']: f"{s['date']} - {s['name']}" for s in sessions}
-        rpt_session_id = st.selectbox("Sélectionnez la date du rapport :", options=list(session_options_rpt.keys()), format_func=lambda x: session_options_rpt[x])
+        # Mise à jour de l'affichage avec le créneau
+        session_options_rpt = {s['id']: f"{s['date']} | {s.get('time_slot', 'Heure N/A')} - {s['name']}" for s in sessions}
+        rpt_session_id = st.selectbox("Sélectionnez la séance du rapport :", options=list(session_options_rpt.keys()), format_func=lambda x: session_options_rpt[x])
+
+        if st.button("Générer la liste des absents"):
+            # ... le reste du code de tab 4 reste exactement identique ...
 
         if st.button("Générer la liste des absents"):
             with st.spinner("Récupération des données..."):
