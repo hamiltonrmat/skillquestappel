@@ -3,46 +3,39 @@ import pandas as pd
 from supabase import create_client, Client
 from datetime import datetime
 import time
+import os  # ← AJOUT MANQUANT
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="SkillQuest - Appels", layout="wide")
+
 def get_secret(section: str, key: str) -> str:
-    """
-    Lecture des secrets :
-    - En local  : via .streamlit/secrets.toml  → st.secrets[section][key]
-    - Production: via variables d'environnement → SECTION_KEY
-    """
     try:
         return st.secrets[section][key]
-    except (KeyError, FileNotFoundError):
+    except Exception:
         env_key = f"{section.upper()}_{key.upper()}"
         value = os.environ.get(env_key)
         if value is None:
             raise ValueError(f"Secret '{env_key}' introuvable.")
         return value
 
-
 # --- 1. SECURITE & AUTHENTIFICATION ---
 def check_password():
-    """Retourne True si l'utilisateur est connecté, sinon affiche le formulaire."""
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
-
     if st.session_state.authenticated:
         return True
 
-    col1, col2, col3 = st.columns([1,2,1])
+    col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.title("🔒 Accès Restreint")
         password = st.text_input("Veuillez entrer le mot de passe administrateur", type="password")
-        
+
         if st.button("Se connecter"):
-            if password == st.secrets["general"]["password"]:
+            if password == get_secret("general", "password"):  # ← CORRIGÉ
                 st.session_state.authenticated = True
                 st.rerun()
             else:
                 st.error("Mot de passe incorrect.")
-    
     return False
 
 if not check_password():
@@ -50,11 +43,11 @@ if not check_password():
 
 # --- CONFIGURATION SUPABASE ---
 try:
-    url = st.secrets["supabase"]["url"]
-    key = st.secrets["supabase"]["key"]
+    url = get_secret("supabase", "url")   # ← CORRIGÉ
+    key = get_secret("supabase", "key")   # ← CORRIGÉ
     supabase: Client = create_client(url, key)
 except Exception as e:
-    st.error("Erreur de configuration des secrets Supabase.")
+    st.error(f"Erreur de configuration des secrets Supabase : {e}")
     st.stop()
 
 st.title("🎓 SkillQuest - Gestion des Appels")
