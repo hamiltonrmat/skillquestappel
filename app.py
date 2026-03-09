@@ -412,9 +412,6 @@ with tab4:
         rpt_session_id = st.selectbox("Sélectionnez la séance du rapport :", options=list(session_options_rpt.keys()), format_func=lambda x: session_options_rpt[x])
 
         if st.button("Générer la liste des absents"):
-            # ... le reste du code de tab 4 reste exactement identique ...
-
-        if st.button("Générer la liste des absents"):
             with st.spinner("Récupération des données..."):
                 acts_resp = supabase.table("activities").select("id, name").eq("session_id", rpt_session_id).execute()
                 act_ids = [a['id'] for a in acts_resp.data]
