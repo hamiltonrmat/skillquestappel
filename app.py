@@ -6,6 +6,21 @@ import time
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="SkillQuest - Appels", layout="wide")
+def get_secret(section: str, key: str) -> str:
+    """
+    Lecture des secrets :
+    - En local  : via .streamlit/secrets.toml  → st.secrets[section][key]
+    - Production: via variables d'environnement → SECTION_KEY
+    """
+    try:
+        return st.secrets[section][key]
+    except (KeyError, FileNotFoundError):
+        env_key = f"{section.upper()}_{key.upper()}"
+        value = os.environ.get(env_key)
+        if value is None:
+            raise ValueError(f"Secret '{env_key}' introuvable.")
+        return value
+
 
 # --- 1. SECURITE & AUTHENTIFICATION ---
 def check_password():
