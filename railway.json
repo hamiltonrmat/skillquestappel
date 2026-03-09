@@ -7,15 +7,3 @@
     "startCommand": "streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.fileWatcherType none --browser.gatherUsageStats false"
   }
 }
-```
-
-Les flags importants sont `--server.address 0.0.0.0` (écoute sur toutes les interfaces) et `--server.port $PORT` (Railway injecte automatiquement la variable `$PORT`).
-
----
-
-### Étape 2 — Protéger les secrets avec `.gitignore`
-```
-.streamlit/secrets.toml
-__pycache__/
-*.pyc
-.env
