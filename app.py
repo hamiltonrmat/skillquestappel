@@ -80,37 +80,42 @@ tab1, tab2, tab3, tab4 = st.tabs(["📥 Importer Inscriptions", "✅ Faire l'App
 with tab1:
     col_import, col_hist = st.columns([2, 1])
 
-    # --- Historique (Mis à jour avec le créneau) ---
+    # --- Historique (Affichage du commentaire) ---
     with col_hist:
         st.subheader("📜 Historique des imports")
         st.caption("Trié par date et créneau")
-        # On récupère le créneau et on trie par Date décroissante puis Créneau décroissant
-        hist_response = supabase.table("sessions").select("date, time_slot, name").order("date", desc=True).order("time_slot", desc=True).execute()
+        # On récupère import_comment en plus
+        hist_response = supabase.table("sessions").select("date, time_slot, name, import_comment").order("date", desc=True).order("time_slot", desc=True).execute()
         if hist_response.data:
             df_hist = pd.DataFrame(hist_response.data)
-            df_hist.columns = ["Date", "Créneau", "Nom"]
+            df_hist.columns = ["Date", "Créneau", "Nom", "Note d'import"]
             st.dataframe(df_hist, use_container_width=True, hide_index=True)
         else:
             st.info("Aucune session importée.")
 
-    # --- Importation (Mis à jour avec la logique de mise à jour) ---
+    # --- Importation ---
     with col_import:
-        st.header("Importer / Mettre à jour une session")
+        st.header("Importer / Mettre à jour une séance")
         
         c1, c2, c3 = st.columns([1.5, 1, 2])
         with c1:
             date_session = st.date_input("Date de la séance", datetime.now())
         with c2:
-            # Liste des créneaux de ton école (tu peux la modifier)
             creneaux_dispo = ["08h30", "10h15", "13h15", "15h00", "16h45", "18h30"]
             creneau_session = st.selectbox("Créneau", creneaux_dispo)
         with c3:
             nom_session = st.text_input("Nom de la séance", f"Séance du {date_session.strftime('%d/%m')}")
 
         details_session = st.text_area(
-            "Détails de la séance (Texte d'aide pour l'appel)",
+            "Détails de la séance (Aide pour l'appel)",
             height=100,
             placeholder="Activité 01 : ... - G104\nActivité 02 : ... - G110"
+        )
+        
+        # NOUVEAU : Le commentaire pour les collègues
+        import_comment = st.text_input(
+            "💬 Commentaire pour les collègues (Optionnel)", 
+            placeholder="Ex: Fichier Moodle extrait à 8h15. Il manque 2 étudiants, je les rajouterai ce midi."
         )
 
         uploaded_file = st.file_uploader("Fichier Excel Moodle (.xlsx)", type=["xlsx"])
@@ -123,9 +128,9 @@ with tab1:
                         "date": str(date_session),
                         "time_slot": creneau_session,
                         "name": nom_session,
-                        "details": details_session
+                        "details": details_session,
+                        "import_comment": import_comment # On sauvegarde la note
                     }
-                    # on_conflict indique à la base de données sur quoi se baser pour savoir si ça existe déjà
                     res_session = supabase.table("sessions").upsert(
                         session_data, on_conflict="date, time_slot"
                     ).execute()
@@ -135,13 +140,10 @@ with tab1:
                     # 2. Lire Excel
                     df = pd.read_excel(uploaded_file)
                     
-                    # 3. Gérer les Activités sans faire de doublons en cas de ré-import
+                    # 3. Gérer les Activités
                     groupes_uniques = df['Groupe'].unique()
-                    
-                    # On récupère les activités DÉJÀ existantes pour cette session
                     existing_acts_resp = supabase.table("activities").select("id, name").eq("session_id", session_id).execute()
                     existing_acts = {a['name']: a['id'] for a in existing_acts_resp.data}
-                    
                     activity_mapping = {} 
                     
                     for grp_name in groupes_uniques:
@@ -149,15 +151,13 @@ with tab1:
                         grp_str = str(grp_name).strip()
                         
                         if grp_str in existing_acts:
-                            # L'activité existe déjà, on récupère juste son ID
                             activity_mapping[grp_name] = existing_acts[grp_str]
                         else:
-                            # C'est une nouvelle activité, on la crée
                             act_data = {"session_id": session_id, "name": grp_str, "room": "À définir"}
                             res_act = supabase.table("activities").insert(act_data).execute()
                             activity_mapping[grp_name] = res_act.data[0]['id']
                     
-                    # 4. Gérer les Étudiants & Inscriptions
+                    # 4. Gérer les Étudiants
                     count_inscrits = 0
                     progress_bar = st.progress(0)
                     total_rows = len(df)
@@ -173,7 +173,6 @@ with tab1:
                         
                         if row['Groupe'] in activity_mapping:
                             act_id = activity_mapping[row['Groupe']]
-                            # Upsert de l'inscription
                             supabase.table("registrations").upsert(
                                 {"student_id": stu_id, "activity_id": act_id, "is_present": False},
                                 on_conflict="student_id, activity_id"
@@ -182,35 +181,33 @@ with tab1:
                         
                         progress_bar.progress((index + 1) / total_rows)
                     
-                    st.success(f"✅ Terminé ! {count_inscrits} inscriptions synchronisées pour le créneau de {creneau_session}.")
-                    time.sleep(2)
+                    st.success(f"✅ Terminé ! {count_inscrits} inscriptions synchronisées.")
+                    time.sleep(1)
                     st.rerun()
                     
                 except Exception as e:
                     st.error(f"Erreur lors de l'import : {e}")
-
-# ==============================================================================
-# TAB 2 : FAIRE L'APPEL (AVEC AIDE-MÉMOIRE)
-# ==============================================================================
 # ==============================================================================
 # TAB 2 : FAIRE L'APPEL
 # ==============================================================================
 with tab2:
     st.header("Feuille de présence numérique")
 
-    # On trie par date puis par créneau
     sessions_resp = supabase.table("sessions").select("*").order("date", desc=True).order("time_slot", desc=True).execute()
     sessions = sessions_resp.data
     
     if not sessions:
         st.warning("Aucune session trouvée.")
     else:
-        # Affichage clair : Date | Créneau - Nom
         session_options = {s['id']: f"{s['date']} | {s.get('time_slot', 'Heure N/A')} - {s['name']}" for s in sessions}
         selected_session_id = st.selectbox("Choisir la séance", options=list(session_options.keys()), format_func=lambda x: session_options[x])
 
         current_session = next((s for s in sessions if s['id'] == selected_session_id), None)
         
+        # NOUVEAU : Affichage bien visible du commentaire d'import s'il y en a un
+        if current_session and current_session.get('import_comment'):
+            st.warning(f"💬 **Note de l'équipe (Import) :** {current_session['import_comment']}")
+
         if current_session and current_session.get('details'):
             with st.expander("ℹ️ Voir le détail des activités et salles (Aide-mémoire)", expanded=True):
                 st.markdown(current_session['details'].replace("\n", "  \n")) 
