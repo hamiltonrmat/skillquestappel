@@ -204,10 +204,11 @@ with tab2:
 
         current_session = next((s for s in sessions if s['id'] == selected_session_id), None)
         
-        # NOUVEAU : Affichage bien visible du commentaire d'import s'il y en a un
+        # Affichage du commentaire d'import
         if current_session and current_session.get('import_comment'):
             st.warning(f"💬 **Note de l'équipe (Import) :** {current_session['import_comment']}")
 
+        # Affichage du détail des salles
         if current_session and current_session.get('details'):
             with st.expander("ℹ️ Voir le détail des activités et salles (Aide-mémoire)", expanded=True):
                 st.markdown(current_session['details'].replace("\n", "  \n")) 
@@ -227,6 +228,19 @@ with tab2:
             regs = data_resp.data
             
             if regs:
+                # --- NOUVEAU : BOUTON TOUT COCHER ---
+                col_info, col_btn = st.columns([2, 1])
+                with col_info:
+                    st.info(f"Inscrits : {len(regs)}")
+                with col_btn:
+                    # Bouton pour tout cocher d'un coup
+                    if st.button("✅ Marquer tous présents", use_container_width=True):
+                        with st.spinner("Mise à jour rapide..."):
+                            # On met à jour toutes les inscriptions de cette activité à True
+                            supabase.table("registrations").update({"is_present": True}).eq("activity_id", selected_act_id).execute()
+                        st.rerun() # Recharge la page pour afficher les cases cochées
+                # ------------------------------------
+
                 list_for_df = []
                 for r in regs:
                     student = r['students']
@@ -241,8 +255,7 @@ with tab2:
                 
                 df_appel = pd.DataFrame(list_for_df).sort_values("Nom")
                 
-                st.info(f"Inscrits : {len(df_appel)}")
-                
+                # --- ÉDITEUR ---
                 edited_df = st.data_editor(
                     df_appel,
                     column_config={
@@ -256,7 +269,7 @@ with tab2:
                 )
                 
                 if st.button("💾 Enregistrer l'appel", type="primary"):
-                    with st.spinner("Sauvegarde..."):
+                    with st.spinner("Sauvegarde détaillée..."):
                         for index, row in edited_df.iterrows():
                             supabase.table("registrations").update({
                                 "is_present": row['Présent'],
