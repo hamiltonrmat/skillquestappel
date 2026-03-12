@@ -204,22 +204,39 @@ with tab2:
 
         current_session = next((s for s in sessions if s['id'] == selected_session_id), None)
         
-        # Affichage du commentaire d'import
         if current_session and current_session.get('import_comment'):
             st.warning(f"💬 **Note de l'équipe (Import) :** {current_session['import_comment']}")
 
-        # Affichage du détail des salles
         if current_session and current_session.get('details'):
             with st.expander("ℹ️ Voir le détail des activités et salles (Aide-mémoire)", expanded=True):
                 st.markdown(current_session['details'].replace("\n", "  \n")) 
 
-        act_resp = supabase.table("activities").select("*").eq("session_id", selected_session_id).order("name").execute()
+        # --- On récupère les activités ET leur statut d'appel ---
+        act_resp = supabase.table("activities").select("id, name, roll_call_done").eq("session_id", selected_session_id).order("name").execute()
         activities = act_resp.data
         
         if activities:
-            act_options = {a['id']: a['name'] for a in activities}
+            # On affiche un petit (✅) dans la liste déroulante si l'appel est déjà fait
+            act_options = {a['id']: f"{'✅' if a['roll_call_done'] else '⏳'} {a['name']}" for a in activities}
             selected_act_id = st.selectbox("Choisir l'activité", options=list(act_options.keys()), format_func=lambda x: act_options[x])
             
+            # Statut actuel de l'activité sélectionnée
+            current_act = next((a for a in activities if a['id'] == selected_act_id), None)
+            is_roll_call_done = current_act['roll_call_done']
+
+            # --- NOUVEAU : BOUTON STATUT APPEL ---
+            if is_roll_call_done:
+                st.success("✅ L'appel a été marqué comme RÉALISÉ pour ce groupe.")
+                if st.button("↩️ Annuler la validation (Rouvrir l'appel)"):
+                    supabase.table("activities").update({"roll_call_done": False}).eq("id", selected_act_id).execute()
+                    st.rerun()
+            else:
+                st.warning("⚠️ L'appel est en attente pour ce groupe.")
+                if st.button("✅ Marquer l'appel comme RÉALISÉ", type="primary"):
+                    supabase.table("activities").update({"roll_call_done": True}).eq("id", selected_act_id).execute()
+                    st.rerun()
+            # ------------------------------------
+
             data_resp = supabase.table("registrations")\
                 .select("id, is_present, comment, students(first_name, last_name, email)")\
                 .eq("activity_id", selected_act_id)\
@@ -228,18 +245,14 @@ with tab2:
             regs = data_resp.data
             
             if regs:
-                # --- NOUVEAU : BOUTON TOUT COCHER ---
                 col_info, col_btn = st.columns([2, 1])
                 with col_info:
                     st.info(f"Inscrits : {len(regs)}")
                 with col_btn:
-                    # Bouton pour tout cocher d'un coup
-                    if st.button("✅ Marquer tous présents", use_container_width=True):
+                    if st.button("✔️ Cocher tous présents (Action rapide)", use_container_width=True):
                         with st.spinner("Mise à jour rapide..."):
-                            # On met à jour toutes les inscriptions de cette activité à True
                             supabase.table("registrations").update({"is_present": True}).eq("activity_id", selected_act_id).execute()
-                        st.rerun() # Recharge la page pour afficher les cases cochées
-                # ------------------------------------
+                        st.rerun()
 
                 list_for_df = []
                 for r in regs:
@@ -250,26 +263,28 @@ with tab2:
                         "Prénom": student['first_name'],
                         "Email": student['email'],
                         "Présent": r['is_present'],
+                        "Appel Fait": "Oui" if is_roll_call_done else "Non", # Nouvelle info visuelle
                         "Commentaire": r['comment'] if r['comment'] else ""
                     })
                 
                 df_appel = pd.DataFrame(list_for_df).sort_values("Nom")
                 
-                # --- ÉDITEUR ---
                 edited_df = st.data_editor(
                     df_appel,
                     column_config={
                         "reg_id": None, 
                         "Présent": st.column_config.CheckboxColumn("Présent ?", default=False),
+                        "Appel Fait": st.column_config.TextColumn("Appel Validé", disabled=True),
                         "Commentaire": st.column_config.TextColumn("Commentaire", width="large")
                     },
-                    disabled=["Nom", "Prénom", "Email"],
+                    disabled=["Nom", "Prénom", "Email", "Appel Fait"],
                     hide_index=True,
                     use_container_width=True
                 )
                 
-                if st.button("💾 Enregistrer l'appel", type="primary"):
-                    with st.spinner("Sauvegarde détaillée..."):
+                # Le bouton sauvegarde les cases à cocher ET valide l'appel automatiquement par confort
+                if st.button("💾 Enregistrer les présences", type="primary"):
+                    with st.spinner("Sauvegarde..."):
                         for index, row in edited_df.iterrows():
                             supabase.table("registrations").update({
                                 "is_present": row['Présent'],
@@ -277,12 +292,17 @@ with tab2:
                                 "marked_at": datetime.now().isoformat()
                             }).eq("id", row['reg_id']).execute()
                         
-                    st.success("Appel enregistré !")
+                        # Si l'appel n'était pas fait, on le passe à Vrai
+                        if not is_roll_call_done:
+                            supabase.table("activities").update({"roll_call_done": True}).eq("id", selected_act_id).execute()
+                            
+                    st.success("Modifications enregistrées et appel validé !")
+                    time.sleep(1)
+                    st.rerun()
             else:
                 st.info("Aucun inscrit dans ce groupe.")
         else:
             st.warning("Aucune activité trouvée pour cette session.")
-
 # ==============================================================================
 # TAB 3 : STATISTIQUES & ANALYSE DÉTAILLÉE (CORRIGÉ)
 # ==============================================================================
@@ -406,33 +426,28 @@ with tab3:
 
 
 # ==============================================================================
-# TAB 4 : RAPPORTS D'ABSENCE (AVEC COMMENTAIRES)
-# ==============================================================================
-# ==============================================================================
-# TAB 4 : RAPPORTS D'ABSENCE
+# TAB 4 : RAPPORTS D'ABSENCE (VUE SCINDÉE)
 # ==============================================================================
 with tab4:
     st.header("📉 Rapport d'Absence par Séance")
-    st.caption("Liste filtrée des étudiants n'ayant pas été marqués présents.")
-
+    
     if not sessions:
         st.warning("Aucune session disponible.")
     else:
-        # Mise à jour de l'affichage avec le créneau
         session_options_rpt = {s['id']: f"{s['date']} | {s.get('time_slot', 'Heure N/A')} - {s['name']}" for s in sessions}
         rpt_session_id = st.selectbox("Sélectionnez la séance du rapport :", options=list(session_options_rpt.keys()), format_func=lambda x: session_options_rpt[x])
 
-        if st.button("Générer la liste des absents"):
-            with st.spinner("Récupération des données..."):
-                acts_resp = supabase.table("activities").select("id, name").eq("session_id", rpt_session_id).execute()
+        if st.button("Générer les listes"):
+            with st.spinner("Analyse des données..."):
+                acts_resp = supabase.table("activities").select("id, name, roll_call_done").eq("session_id", rpt_session_id).execute()
                 act_ids = [a['id'] for a in acts_resp.data]
                 
                 if not act_ids:
                     st.warning("Aucune activité trouvée pour cette session.")
                 else:
-                    # Ajout de 'comment' dans la requête
+                    # On récupère toutes les inscriptions où l'étudiant n'est PAS coché présent
                     absents_resp = supabase.table("registrations")\
-                        .select("is_present, comment, students(first_name, last_name, email), activities(name)")\
+                        .select("is_present, comment, students(first_name, last_name, email), activities(name, roll_call_done)")\
                         .in_("activity_id", act_ids)\
                         .eq("is_present", False)\
                         .execute()
@@ -440,31 +455,52 @@ with tab4:
                     data_absents = absents_resp.data
                     
                     if data_absents:
-                        clean_list = []
+                        list_confirmes = []
+                        list_en_attente = []
+                        
                         for item in data_absents:
                             stu = item['students']
                             act = item['activities']
-                            clean_list.append({
+                            
+                            row_data = {
                                 "Activité": act['name'],
                                 "Nom": stu['last_name'],
                                 "Prénom": stu['first_name'],
                                 "Email": stu['email'],
-                                "Commentaire": item['comment'] if item['comment'] else "" # Afficher le motif
-                            })
+                                "Commentaire": item['comment'] if item['comment'] else ""
+                            }
+                            
+                            # Tri selon que l'appel a été fait ou non dans cette activité
+                            if act['roll_call_done']:
+                                list_confirmes.append(row_data)
+                            else:
+                                list_en_attente.append(row_data)
                         
-                        df_absents = pd.DataFrame(clean_list).sort_values(by=["Activité", "Nom"])
-                        
-                        st.subheader(f"Absents : {len(df_absents)} étudiants")
-                        st.dataframe(df_absents, use_container_width=True, hide_index=True)
-                        
-                        csv = df_absents.to_csv(index=False).encode('utf-8')
-                        filename = f"Absents_{session_options_rpt[rpt_session_id]}.csv"
-                        
-                        st.download_button(
-                            label="📥 Télécharger la liste (CSV)",
-                            data=csv,
-                            file_name=filename,
-                            mime='text/csv',
-                        )
+                        # --- VUE 1 : VRAIS ABSENTS ---
+                        st.subheader("🔴 Absents Confirmés")
+                        st.caption("Étudiants marqués absents dans les activités où l'appel a été validé.")
+                        if list_confirmes:
+                            df_confirmes = pd.DataFrame(list_confirmes).sort_values(by=["Activité", "Nom"])
+                            st.dataframe(df_confirmes, use_container_width=True, hide_index=True)
+                            
+                            csv_conf = df_confirmes.to_csv(index=False).encode('utf-8')
+                            st.download_button("📥 Télécharger Absents Confirmés (CSV)", data=csv_conf, file_name=f"Absents_Confirmes_{session_options_rpt[rpt_session_id]}.csv", mime='text/csv')
+                        else:
+                            st.success("Aucun absent confirmé ! 🎉")
+
+                        st.divider()
+
+                        # --- VUE 2 : EN ATTENTE D'APPEL ---
+                        st.subheader("⏳ Appel Non Réalisé (Statut Inconnu)")
+                        st.caption("Étudiants inscrits dans des groupes où l'enseignant n'a pas encore validé l'appel.")
+                        if list_en_attente:
+                            df_attente = pd.DataFrame(list_en_attente).sort_values(by=["Activité", "Nom"])
+                            st.dataframe(df_attente, use_container_width=True, hide_index=True)
+                            
+                            csv_att = df_attente.to_csv(index=False).encode('utf-8')
+                            st.download_button("📥 Télécharger En Attente (CSV)", data=csv_att, file_name=f"En_Attente_{session_options_rpt[rpt_session_id]}.csv", mime='text/csv')
+                        else:
+                            st.info("Tous les appels ont été réalisés pour cette séance.")
+                            
                     else:
-                        st.success("Aucun absent détecté pour cette session.")
+                        st.success("Aucun étudiant absent détecté (100% de présence validée) !")
