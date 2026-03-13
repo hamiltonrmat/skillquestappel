@@ -80,11 +80,9 @@ tab1, tab2, tab3, tab4 = st.tabs(["📥 Importer Inscriptions", "✅ Faire l'App
 with tab1:
     col_import, col_hist = st.columns([2, 1])
 
-    # --- Historique (Affichage du commentaire) ---
     with col_hist:
         st.subheader("📜 Historique des imports")
         st.caption("Trié par date et créneau")
-        # On récupère import_comment en plus
         hist_response = supabase.table("sessions").select("date, time_slot, name, import_comment").order("date", desc=True).order("time_slot", desc=True).execute()
         if hist_response.data:
             df_hist = pd.DataFrame(hist_response.data)
@@ -93,7 +91,6 @@ with tab1:
         else:
             st.info("Aucune session importée.")
 
-    # --- Importation ---
     with col_import:
         st.header("Importer / Mettre à jour une séance")
         
@@ -112,86 +109,111 @@ with tab1:
             placeholder="Activité 01 : ... - G104\nActivité 02 : ... - G110"
         )
         
-        # NOUVEAU : Le commentaire pour les collègues
         import_comment = st.text_input(
             "💬 Commentaire pour les collègues (Optionnel)", 
-            placeholder="Ex: Fichier Moodle extrait à 8h15. Il manque 2 étudiants, je les rajouterai ce midi."
+            placeholder="Ex: Fichier Moodle extrait à 8h15. Il manque 2 étudiants."
         )
 
         uploaded_file = st.file_uploader("Fichier Excel Moodle (.xlsx)", type=["xlsx"])
 
         if uploaded_file and st.button("Lancer l'importation", type="primary"):
-            with st.spinner("Analyse et mise à jour en cours..."):
+            with st.spinner("Analyse et filtrage en cours..."):
                 try:
-                    # 1. Créer ou Mettre à jour la Session (UPSERT)
+                    # 1. Créer ou Mettre à jour la Session
                     session_data = {
                         "date": str(date_session),
                         "time_slot": creneau_session,
                         "name": nom_session,
                         "details": details_session,
-                        "import_comment": import_comment # On sauvegarde la note
+                        "import_comment": import_comment
                     }
                     res_session = supabase.table("sessions").upsert(
                         session_data, on_conflict="date, time_slot"
                     ).execute()
-                    
                     session_id = res_session.data[0]['id']
                     
                     # 2. Lire Excel
                     df = pd.read_excel(uploaded_file)
                     
-                    # 3. Gérer les Activités
-                    groupes_uniques = df['Groupe'].unique()
+                    # 3. Gérer les Activités (On ignore les cases vides pour l'instant)
+                    groupes_uniques = df['Groupe'].dropna().unique()
                     existing_acts_resp = supabase.table("activities").select("id, name").eq("session_id", session_id).execute()
                     existing_acts = {a['name']: a['id'] for a in existing_acts_resp.data}
                     activity_mapping = {} 
                     
                     for grp_name in groupes_uniques:
-                        if pd.isna(grp_name): continue
                         grp_str = str(grp_name).strip()
-                        
                         if grp_str in existing_acts:
                             activity_mapping[grp_name] = existing_acts[grp_str]
                         else:
                             act_data = {"session_id": session_id, "name": grp_str, "room": "À définir"}
                             res_act = supabase.table("activities").insert(act_data).execute()
                             activity_mapping[grp_name] = res_act.data[0]['id']
-                    
-                    # 4. Gérer les Étudiants
+
+                    # --- NOUVEAU : CRÉATION DU GROUPE FANTÔME POUR LES NON-INSCRITS ---
+                    nom_groupe_vide = "Sans groupe (Non affecté)"
+                    if nom_groupe_vide in existing_acts:
+                        ghost_act_id = existing_acts[nom_groupe_vide]
+                    else:
+                        # On met roll_call_done à True d'office pour qu'ils soient traités comme de vrais absents
+                        ghost_data = {"session_id": session_id, "name": nom_groupe_vide, "room": "N/A", "roll_call_done": True}
+                        res_ghost = supabase.table("activities").insert(ghost_data).execute()
+                        ghost_act_id = res_ghost.data[0]['id']
+                    # ------------------------------------------------------------------
+
+                    # 4. Filtrage et Création des Étudiants
                     count_inscrits = 0
                     progress_bar = st.progress(0)
                     total_rows = len(df)
                     
                     for index, row in df.iterrows():
-                        if pd.isna(row['Groupe']): continue
+                        # Sécurisation de l'email
+                        email = str(row.get('Adresse de courriel', '')).strip().lower()
                         
-                        email = row.get('Adresse de courriel', '')
+                        # --- FILTRAGE DES PROFESSEURS ---
+                        # Si ce n'est pas un étudiant, on passe à la ligne suivante
+                        if not email.endswith("@etu.unilasalle.fr"):
+                            progress_bar.progress((index + 1) / total_rows)
+                            continue
+
+                        # --- GESTION DES GROUPES VIDES ---
+                        is_unassigned = pd.isna(row['Groupe']) or str(row['Groupe']).strip() == ""
+                        
+                        if is_unassigned:
+                            act_id = ghost_act_id  # On l'envoie dans le groupe fantôme
+                        else:
+                            act_id = activity_mapping[row['Groupe']]
+
+                        # Inscription en base de données
                         prenom = row.get('Prénom', '')
                         nom = row.get('Nom de famille', '')
-                        
                         stu_id = get_or_create_student(email, prenom, nom)
                         
-                        if row['Groupe'] in activity_mapping:
-                            act_id = activity_mapping[row['Groupe']]
-                            supabase.table("registrations").upsert(
-                                {"student_id": stu_id, "activity_id": act_id, "is_present": False},
-                                on_conflict="student_id, activity_id"
-                            ).execute()
-                            count_inscrits += 1
+                        supabase.table("registrations").upsert(
+                            {"student_id": stu_id, "activity_id": act_id, "is_present": False},
+                            on_conflict="student_id, activity_id"
+                        ).execute()
                         
+                        count_inscrits += 1
                         progress_bar.progress((index + 1) / total_rows)
                     
-                    st.success(f"✅ Terminé ! {count_inscrits} inscriptions synchronisées.")
-                    time.sleep(1)
+                    st.success(f"✅ Terminé ! {count_inscrits} étudiants traités (les professeurs ont été ignorés).")
+                    time.sleep(2)
                     st.rerun()
                     
                 except Exception as e:
                     st.error(f"Erreur lors de l'import : {e}")
 # ==============================================================================
-# TAB 2 : FAIRE L'APPEL
+# TAB 2 : FAIRE L'APPEL (VUE "PILLS" AVEC MÉMOIRE)
 # ==============================================================================
 with tab2:
     st.header("Feuille de présence numérique")
+
+    # --- NOUVEAU : Fonction pour vider la mémoire des pilules si on change de date ---
+    def reset_pills_memory():
+        if 'memoire_pills' in st.session_state:
+            st.session_state['memoire_pills'] = []
+    # --------------------------------------------------------------------------------
 
     sessions_resp = supabase.table("sessions").select("*").order("date", desc=True).order("time_slot", desc=True).execute()
     sessions = sessions_resp.data
@@ -200,7 +222,14 @@ with tab2:
         st.warning("Aucune session trouvée.")
     else:
         session_options = {s['id']: f"{s['date']} | {s.get('time_slot', 'Heure N/A')} - {s['name']}" for s in sessions}
-        selected_session_id = st.selectbox("Choisir la séance", options=list(session_options.keys()), format_func=lambda x: session_options[x])
+        
+        # On ajoute on_change=reset_pills_memory pour vider la sélection si on change de jour
+        selected_session_id = st.selectbox(
+            "Choisir la séance", 
+            options=list(session_options.keys()), 
+            format_func=lambda x: session_options[x],
+            on_change=reset_pills_memory 
+        )
 
         current_session = next((s for s in sessions if s['id'] == selected_session_id), None)
         
@@ -208,113 +237,114 @@ with tab2:
             st.warning(f"💬 **Note de l'équipe (Import) :** {current_session['import_comment']}")
 
         if current_session and current_session.get('details'):
-            with st.expander("ℹ️ Voir le détail des activités et salles (Aide-mémoire)", expanded=True):
+            with st.expander("ℹ️ Voir le détail des activités et salles (Aide-mémoire)", expanded=False):
                 st.markdown(current_session['details'].replace("\n", "  \n")) 
 
-        # --- On récupère les activités ET leur statut d'appel ---
         act_resp = supabase.table("activities").select("id, name, roll_call_done").eq("session_id", selected_session_id).order("name").execute()
         activities = act_resp.data
         
         if activities:
-            # On affiche un petit (✅) dans la liste déroulante si l'appel est déjà fait
             act_options = {a['id']: f"{'✅' if a['roll_call_done'] else '⏳'} {a['name']}" for a in activities}
-            selected_act_id = st.selectbox("Choisir l'activité", options=list(act_options.keys()), format_func=lambda x: act_options[x])
             
-            # Statut actuel de l'activité sélectionnée
-            current_act = next((a for a in activities if a['id'] == selected_act_id), None)
-            is_roll_call_done = current_act['roll_call_done']
+            # --- NOUVEAU : On ajoute key="memoire_pills" pour que Streamlit retienne le choix ---
+            selected_act_ids = st.pills(
+                "Sélectionnez une ou plusieurs activités pour afficher les étudiants :", 
+                options=list(act_options.keys()), 
+                format_func=lambda x: act_options[x],
+                selection_mode="multi",
+                key="memoire_pills" 
+            )
+            # ------------------------------------------------------------------------------------
 
-            # --- NOUVEAU : BOUTON STATUT APPEL ---
-            if is_roll_call_done:
-                st.success("✅ L'appel a été marqué comme RÉALISÉ pour ce groupe.")
-                if st.button("↩️ Annuler la validation (Rouvrir l'appel)"):
-                    supabase.table("activities").update({"roll_call_done": False}).eq("id", selected_act_id).execute()
-                    st.rerun()
+            if not selected_act_ids:
+                st.info("👆 Cliquez sur les étiquettes ci-dessus pour afficher les listes d'appel.")
             else:
-                st.warning("⚠️ L'appel est en attente pour ce groupe.")
-                if st.button("✅ Marquer l'appel comme RÉALISÉ", type="primary"):
-                    supabase.table("activities").update({"roll_call_done": True}).eq("id", selected_act_id).execute()
-                    st.rerun()
-            # ------------------------------------
+                selected_activities = [a for a in activities if a['id'] in selected_act_ids]
+                all_done = all(a['roll_call_done'] for a in selected_activities)
 
-            data_resp = supabase.table("registrations")\
-                .select("id, is_present, comment, students(first_name, last_name, email)")\
-                .eq("activity_id", selected_act_id)\
-                .execute()
-            
-            regs = data_resp.data
-            
-            if regs:
-                col_info, col_btn = st.columns([2, 1])
-                with col_info:
-                    st.info(f"Inscrits : {len(regs)}")
-                with col_btn:
-                    if st.button("✔️ Cocher tous présents (Action rapide)", use_container_width=True):
-                        with st.spinner("Mise à jour rapide..."):
-                            supabase.table("registrations").update({"is_present": True}).eq("activity_id", selected_act_id).execute()
+                if all_done:
+                    st.success("✅ L'appel a été marqué comme RÉALISÉ pour TOUTES les activités sélectionnées.")
+                    if st.button("↩️ Annuler la validation pour la sélection"):
+                        supabase.table("activities").update({"roll_call_done": False}).in_("id", selected_act_ids).execute()
                         st.rerun()
+                else:
+                    st.warning("⚠️ L'appel est en attente pour au moins une des activités sélectionnées.")
 
-                list_for_df = []
-                for r in regs:
-                    student = r['students']
-                    list_for_df.append({
-                        "reg_id": r['id'],
-                        "Nom": student['last_name'],
-                        "Prénom": student['first_name'],
-                        "Email": student['email'],
-                        "Présent": r['is_present'],
-                        "Appel Fait": "Oui" if is_roll_call_done else "Non", # Nouvelle info visuelle
-                        "Commentaire": r['comment'] if r['comment'] else ""
-                    })
+                data_resp = supabase.table("registrations")\
+                    .select("id, is_present, comment, students(first_name, last_name, email), activities(name)")\
+                    .in_("activity_id", selected_act_ids)\
+                    .execute()
                 
-                df_appel = pd.DataFrame(list_for_df).sort_values("Nom")
+                regs = data_resp.data
                 
-                edited_df = st.data_editor(
-                    df_appel,
-                    column_config={
-                        "reg_id": None, 
-                        "Présent": st.column_config.CheckboxColumn("Présent ?", default=False),
-                        "Appel Fait": st.column_config.TextColumn("Appel Validé", disabled=True),
-                        "Commentaire": st.column_config.TextColumn("Commentaire", width="large")
-                    },
-                    disabled=["Nom", "Prénom", "Email", "Appel Fait"],
-                    hide_index=True,
-                    use_container_width=True
-                )
-                
-                # Le bouton sauvegarde les cases à cocher ET valide l'appel automatiquement par confort
-                if st.button("💾 Enregistrer les présences", type="primary"):
-                    with st.spinner("Sauvegarde..."):
-                        for index, row in edited_df.iterrows():
-                            supabase.table("registrations").update({
-                                "is_present": row['Présent'],
-                                "comment": row['Commentaire'],
-                                "marked_at": datetime.now().isoformat()
-                            }).eq("id", row['reg_id']).execute()
-                        
-                        # Si l'appel n'était pas fait, on le passe à Vrai
-                        if not is_roll_call_done:
-                            supabase.table("activities").update({"roll_call_done": True}).eq("id", selected_act_id).execute()
+                if regs:
+                    col_info, col_btn = st.columns([2, 1])
+                    with col_info:
+                        st.info(f"Total inscrits affichés : {len(regs)}")
+                    with col_btn:
+                        if st.button("✔️ Cocher tous présents", use_container_width=True):
+                            with st.spinner("Mise à jour rapide..."):
+                                supabase.table("registrations").update({"is_present": True}).in_("activity_id", selected_act_ids).execute()
+                            st.rerun()
+
+                    list_for_df = []
+                    for r in regs:
+                        student = r['students']
+                        activity_name = r['activities']['name']
+                        list_for_df.append({
+                            "reg_id": r['id'],
+                            "Activité": activity_name, 
+                            "Nom": student['last_name'],
+                            "Prénom": student['first_name'],
+                            "Email": student['email'],
+                            "Présent": r['is_present'],
+                            "Commentaire": r['comment'] if r['comment'] else ""
+                        })
+                    
+                    df_appel = pd.DataFrame(list_for_df).sort_values(by=["Activité", "Nom"])
+                    
+                    edited_df = st.data_editor(
+                        df_appel,
+                        column_config={
+                            "reg_id": None, 
+                            "Activité": st.column_config.TextColumn("Activité", disabled=True),
+                            "Présent": st.column_config.CheckboxColumn("Présent ?", default=False),
+                            "Commentaire": st.column_config.TextColumn("Commentaire", width="large")
+                        },
+                        disabled=["Activité", "Nom", "Prénom", "Email"],
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                    
+                    if st.button("💾 Enregistrer et Valider l'appel", type="primary"):
+                        with st.spinner("Sauvegarde des présences..."):
+                            for index, row in edited_df.iterrows():
+                                supabase.table("registrations").update({
+                                    "is_present": row['Présent'],
+                                    "comment": row['Commentaire'],
+                                    "marked_at": datetime.now().isoformat()
+                                }).eq("id", row['reg_id']).execute()
                             
-                    st.success("Modifications enregistrées et appel validé !")
-                    time.sleep(1)
-                    st.rerun()
-            else:
-                st.info("Aucun inscrit dans ce groupe.")
+                            supabase.table("activities").update({"roll_call_done": True}).in_("id", selected_act_ids).execute()
+                                
+                        st.success("Modifications enregistrées et appels validés pour la sélection !")
+                        time.sleep(1)
+                        st.rerun()
+                else:
+                    st.info("Aucun inscrit dans les groupes sélectionnés.")
         else:
             st.warning("Aucune activité trouvée pour cette session.")
 # ==============================================================================
-# TAB 3 : STATISTIQUES & ANALYSE DÉTAILLÉE (CORRIGÉ)
+# TAB 3 : STATISTIQUES & ANALYSE DÉTAILLÉE
 # ==============================================================================
 with tab3:
     st.header("📊 Tableau de Bord Analytique")
     
-    # Bouton pour charger/rafraîchir les données
     if st.button("🔄 Charger / Rafraîchir les données", key="refresh_stats"):
         with st.spinner("Calcul des statistiques en cours..."):
-            # 1. Récupération de TOUTES les données
+            # 1. Récupération des données INCLUANT le créneau (time_slot) et le statut de l'appel
             response = supabase.table("registrations").select(
-                "is_present, activities(name, sessions(date, name))"
+                "is_present, activities(name, roll_call_done, sessions(date, time_slot, name))"
             ).execute()
             
             data = response.data
@@ -327,18 +357,28 @@ with tab3:
                 for item in data:
                     act = item['activities']
                     sess = act['sessions']
+                    
+                    # NOUVEAU : On exclut les activités où l'appel n'est pas encore fait
+                    # pour ne pas fausser les statistiques avec de faux "100% d'absents"
+                    if not act.get('roll_call_done', False):
+                        continue
+                        
+                    creneau = sess.get('time_slot', 'N/A')
+                    
                     rows.append({
                         "Date": sess['date'],
+                        "Créneau": creneau,
+                        "Séance Complète": f"{sess['date']} | {creneau}", # Pour le filtre
                         "Session": sess['name'],
                         "Activité": act['name'],
                         "Statut": "Présent" if item['is_present'] else "Absent"
                     })
                 
-                # STOCKAGE DANS LA SESSION (C'est ici que la magie opère)
+                # STOCKAGE DANS LA SESSION
                 st.session_state['df_stats'] = pd.DataFrame(rows)
 
     # VÉRIFICATION : Est-ce qu'on a des données en mémoire ?
-    if 'df_stats' in st.session_state:
+    if 'df_stats' in st.session_state and not st.session_state['df_stats'].empty:
         df_stats = st.session_state['df_stats']
 
         # --- KPI GLOBAUX ---
@@ -347,30 +387,35 @@ with tab3:
         taux_absenteisme = (total_absents / total_inscrits) * 100 if total_inscrits > 0 else 0
 
         kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Total Inscriptions", total_inscrits)
+        kpi1.metric("Total Inscriptions Évaluées", total_inscrits, help="Ne compte que les appels validés.")
         kpi2.metric("Total Absences", total_absents)
         kpi3.metric("Taux d'absentéisme Global", f"{taux_absenteisme:.1f} %", delta_color="inverse")
 
         st.divider()
 
-        # --- ANALYSE PAR SESSION (DATE) ---
-        st.subheader("📅 Absentéisme par Session")
+        # --- ANALYSE PAR SÉANCE (DATE + CRÉNEAU) ---
+        st.subheader("📅 Absentéisme par Séance")
         
-        df_session = df_stats.groupby(["Date", "Session"]).agg(
+        # On groupe maintenant par Date ET Créneau
+        df_session = df_stats.groupby(["Date", "Créneau", "Session"]).agg(
             Inscrits=('Statut', 'count'),
             Absents=('Statut', lambda x: (x == 'Absent').sum())
         ).reset_index()
         
-        df_session["% Absentéisme"] = (100*df_session["Absents"] / df_session["Inscrits"])
+        # Calcul du % (entre 0 et 1 pour que le formatage Streamlit fonctionne parfaitement)
+        df_session["% Absentéisme"] = df_session["Absents"] / df_session["Inscrits"]
+        
+        # Tri chronologique inverse
+        df_session = df_session.sort_values(by=["Date", "Créneau"], ascending=[False, False])
         
         st.dataframe(
-            df_session.style.format({"% Absentéisme": "{:.1%}"}),
+            df_session,
             column_config={
                 "% Absentéisme": st.column_config.ProgressColumn(
                     "Taux d'absence",
-                    format="%.1f%%",
+                    format="%.1f%%", # Affiche en %
                     min_value=0,
-                    max_value=100,
+                    max_value=1, # Basé sur un ratio de 0 à 1
                 ),
             },
             use_container_width=True,
@@ -381,29 +426,32 @@ with tab3:
 
         # --- ANALYSE DÉTAILLÉE PAR ACTIVITÉ ---
         st.subheader("🏊 Détail par Activité")
-        st.caption("Filtrer pour voir les détails d'une date spécifique.")
+        st.caption("Filtrer pour voir les détails d'une séance spécifique.")
 
-        # FILTRE INTERACTIF (Ne fait plus disparaître les données)
-        dates_dispo = sorted(df_stats["Date"].unique(), reverse=True)
-        selected_date_filter = st.selectbox("Filtrer par date", ["Toutes les dates"] + list(dates_dispo))
+        # FILTRE INTERACTIF PAR SÉANCE (Date + Créneau)
+        seances_dispo = sorted(df_stats["Séance Complète"].unique(), reverse=True)
+        selected_filter = st.selectbox("Filtrer par séance :", ["Toutes les séances"] + list(seances_dispo))
 
         # Application du filtre
-        if selected_date_filter == "Toutes les dates":
+        if selected_filter == "Toutes les séances":
             df_filtered = df_stats
         else:
-            df_filtered = df_stats[df_stats["Date"] == selected_date_filter]
+            df_filtered = df_stats[df_stats["Séance Complète"] == selected_filter]
 
-        # Groupement par Activité
-        df_activity = df_filtered.groupby(["Activité", "Session"]).agg(
+        # Groupement par Activité en incluant le Créneau
+        df_activity = df_filtered.groupby(["Activité", "Créneau", "Session"]).agg(
             Inscrits=('Statut', 'count'),
             Absents=('Statut', lambda x: (x == 'Absent').sum())
         ).reset_index()
 
         if not df_activity.empty:
-            df_activity["% Absentéisme"] = (100*df_activity["Absents"] / df_activity["Inscrits"])
+            df_activity["% Absentéisme"] = df_activity["Absents"] / df_activity["Inscrits"]
             
-            # Tri par taux d'absentéisme décroissant
+            # Tri par taux d'absentéisme décroissant (les pires en haut)
             df_activity = df_activity.sort_values(by="% Absentéisme", ascending=False)
+
+            # On réorganise les colonnes pour un affichage plus propre
+            df_activity = df_activity[["Créneau", "Activité", "Session", "Inscrits", "Absents", "% Absentéisme"]]
 
             st.dataframe(
                 df_activity,
@@ -412,7 +460,7 @@ with tab3:
                         "Taux d'absence",
                         format="%.1f%%",
                         min_value=0,
-                        max_value=100,
+                        max_value=1,
                     ),
                 },
                 use_container_width=True,
@@ -421,6 +469,8 @@ with tab3:
         else:
             st.info("Aucune donnée pour cette sélection.")
     
+    elif 'df_stats' in st.session_state and st.session_state['df_stats'].empty:
+        st.info("Aucune statistique disponible. Assurez-vous d'avoir validé au moins un appel (bouton '✅ Enregistrer et Valider l'appel' dans l'onglet Appel).")
     else:
         st.info("Cliquez sur le bouton ci-dessus pour charger les statistiques.")
 
