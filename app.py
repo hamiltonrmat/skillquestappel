@@ -403,7 +403,7 @@ with tab3:
         ).reset_index()
         
         # Calcul du % (entre 0 et 1 pour que le formatage Streamlit fonctionne parfaitement)
-        df_session["% Absentéisme"] = df_session["Absents"] / df_session["Inscrits"]
+        df_session["% Absentéisme"] = 100*(df_session["Absents"] / df_session["Inscrits"])
         
         # Tri chronologique inverse
         df_session = df_session.sort_values(by=["Date", "Créneau"], ascending=[False, False])
@@ -415,7 +415,7 @@ with tab3:
                     "Taux d'absence",
                     format="%.1f%%", # Affiche en %
                     min_value=0,
-                    max_value=1, # Basé sur un ratio de 0 à 1
+                    max_value=100, # Basé sur un ratio de 0 à 1
                 ),
             },
             use_container_width=True,
@@ -445,7 +445,7 @@ with tab3:
         ).reset_index()
 
         if not df_activity.empty:
-            df_activity["% Absentéisme"] = df_activity["Absents"] / df_activity["Inscrits"]
+            df_activity["% Absentéisme"] = 100*(df_activity["Absents"] / df_activity["Inscrits"])
             
             # Tri par taux d'absentéisme décroissant (les pires en haut)
             df_activity = df_activity.sort_values(by="% Absentéisme", ascending=False)
@@ -460,7 +460,7 @@ with tab3:
                         "Taux d'absence",
                         format="%.1f%%",
                         min_value=0,
-                        max_value=1,
+                        max_value=100,
                     ),
                 },
                 use_container_width=True,
