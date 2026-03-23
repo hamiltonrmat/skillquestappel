@@ -87,7 +87,7 @@ with tab1:
         if hist_response.data:
             df_hist = pd.DataFrame(hist_response.data)
             df_hist.columns = ["Date", "Créneau", "Nom", "Note d'import"]
-            st.dataframe(df_hist, use_container_width=True, hide_index=True)
+            st.dataframe(df_hist.head(), use_container_width=True, hide_index=True)
         else:
             st.info("Aucune session importée.")
 
